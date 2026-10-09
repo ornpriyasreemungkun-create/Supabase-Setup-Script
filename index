@@ -1,0 +1,194 @@
+-- STREAMING_CHUNK:Enabling Extensions and Creating Helper Functions
+create extension if not exists "uuid-ossp";
+
+-- Helper function to check if the current authenticated user is a teacher
+create or replace function public.is_teacher()
+returns boolean
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  return exists (
+    select 1 from public.teachers
+    where user_id = auth.uid()
+  );
+end;
+$$ language plpgsql;
+
+-- STREAMING_CHUNK:Creating Core Tables
+create table if not exists public.teachers (
+    user_id uuid primary key references auth.users(id) on delete cascade,
+    created_at timestamp with time zone default timezone('utc'::text, now()) not null
+);
+
+create table if not exists public.students (
+    id varchar(11) primary key, -- 11-digit student ID
+    title varchar(50) not null,
+    first_name varchar(100) not null,
+    last_name varchar(100) not null,
+    section varchar(50),
+    user_id uuid references auth.users(id) on delete cascade unique,
+    photo_path text,
+    created_at timestamp with time zone default timezone('utc'::text, now()) not null
+);
+
+create table if not exists public.attempts (
+    id uuid primary key default uuid_generate_v4(),
+    user_id uuid references auth.users(id) on delete cascade not null,
+    kind varchar(10) check (kind in ('pre', 'post')) not null,
+    score int not null check (score >= 0 and score <= 10),
+    answers jsonb not null,
+    created_at timestamp with time zone default timezone('utc'::text, now()) not null,
+    unique (user_id, kind)
+);
+
+create table if not exists public.progress (
+    id uuid primary key default uuid_generate_v4(),
+    user_id uuid references auth.users(id) on delete cascade not null,
+    unit int not null check (unit between 1 and 5),
+    done boolean default true,
+    unique (user_id, unit)
+);
+
+create table if not exists public.submissions (
+    id uuid primary key default uuid_generate_v4(),
+    user_id uuid references auth.users(id) on delete cascade not null,
+    unit int not null default 4,
+    kind varchar(10) check (kind in ('link', 'file')) not null,
+    url text,
+    storage_path text,
+    note text,
+    score int check (score between 0 and 10),
+    teacher_comment text,
+    created_at timestamp with time zone default timezone('utc'::text, now()) not null
+);
+
+create table if not exists public.materials (
+    id uuid primary key default uuid_generate_v4(),
+    title text not null,
+    kind varchar(10) check (kind in ('file', 'link', 'video')) not null,
+    url text,
+    storage_path text,
+    file_name text,
+    created_at timestamp with time zone default timezone('utc'::text, now()) not null
+);
+
+-- STREAMING_CHUNK:Enabling Row Level Security (RLS)
+alter table public.teachers enable row level security;
+alter table public.students enable row level security;
+alter table public.attempts enable row level security;
+alter table public.progress enable row level security;
+alter table public.submissions enable row level security;
+alter table public.materials enable row level security;
+
+-- Revoke all from anon, grant necessary to authenticated
+revoke all on all tables in schema public from anon, authenticated;
+grant select, insert, update on public.students to authenticated;
+grant select, insert on public.attempts to authenticated;
+grant select, insert, update on public.progress to authenticated;
+grant select, insert on public.submissions to authenticated;
+grant select on public.materials to authenticated;
+grant all on all tables in schema public to service_role;
+
+-- STREAMING_CHUNK:Creating RLS Policies
+-- teachers policy
+create policy "Teachers full access" on public.teachers
+    for all to authenticated
+    using (public.is_teacher())
+    with check (public.is_teacher());
+
+-- students policy: student views/updates own, teacher views all
+create policy "Students view own or teacher" on public.students
+    for select to authenticated
+    using (user_id = auth.uid() or public.is_teacher());
+
+create policy "Students insert own profile" on public.students
+    for insert to authenticated
+    with check (user_id = auth.uid());
+
+create policy "Students update own photo only" on public.students
+    for update to authenticated
+    using (user_id = auth.uid())
+    with check (user_id = auth.uid());
+
+-- attempts policy
+create policy "Attempts access" on public.attempts
+    for select to authenticated
+    using (user_id = auth.uid() or public.is_teacher());
+
+create policy "Attempts insert own" on public.attempts
+    for insert to authenticated
+    with check (user_id = auth.uid());
+
+-- progress policy
+create policy "Progress access" on public.progress
+    for select to authenticated
+    using (user_id = auth.uid() or public.is_teacher());
+
+create policy "Progress insert/update own" on public.progress
+    for all to authenticated
+    using (user_id = auth.uid() or public.is_teacher())
+    with check (user_id = auth.uid());
+
+-- submissions policy (student cannot update score/teacher_comment)
+create policy "Submissions access" on public.submissions
+    for select to authenticated
+    using (user_id = auth.uid() or public.is_teacher());
+
+create policy "Submissions insert own" on public.submissions
+    for insert to authenticated
+    with check (user_id = auth.uid());
+
+create policy "Teacher update submissions score" on public.submissions
+    for update to authenticated
+    using (public.is_teacher())
+    with check (public.is_teacher());
+
+-- materials policy
+create policy "Materials read all authenticated" on public.materials
+    for select to authenticated
+    using (true);
+
+create policy "Teacher write materials" on public.materials
+    for all to authenticated
+    using (public.is_teacher())
+    with check (public.is_teacher());
+
+-- STREAMING_CHUNK:Creating Trigger for Auto Student Linking on Auth Signup
+create or replace function public.handle_new_user_student()
+returns trigger
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  -- If email starts with 11 digits, link student profile
+  if new.email ~ '^\d{11}@' then
+    update public.students
+    set user_id = new.id
+    where id = split_part(new.email, '@', 1)
+      and user_id is null;
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+create or drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user_student();
+
+-- STREAMING_CHUNK:Inserting Mock Student Data (6 Rows)
+-- หมายเหตุ: นำเข้าข้อมูลรายชื่อนักศึกษาตัวลอง 6 แถว (สามารถใช้ Table Editor นำเข้าผ่าน CSV ของจริงได้)
+insert into public.students (id, title, first_name, last_name, section) values
+('65123456781', 'นาย', 'กิตติภัทร', 'ใจดี', '01'),
+('65123456782', 'นางสาว', 'นภัสสร', 'Sakon', '01'),
+('65123456783', 'นาย', 'ธนดล', 'ราชภัฏ', '02'),
+('65123456784', 'นางสาว', 'ปวีณา', 'ศรีสกล', '02'),
+('65123456785', 'นาย', 'พงศกร', 'การศึกษา', '01'),
+('65123456786', 'นางสาว', 'สุชาดา', 'เทคโนโลยี', '02')
+on conflict (id) do nothing;
+
+/*
+-- คำสั่งสำหรับตั้งค่าผู้สอน (เปิดคอมเมนต์บรรทัดล่างเมื่อต้องการกำหนดอีเมลผู้สอนของคุณใน auth.users)
+-- insert into public.teachers (user_id) select id from auth.users where email = 'teacher@snru.ac.th';
+*/
